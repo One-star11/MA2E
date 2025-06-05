@@ -1,22 +1,55 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .ace_utils import StateActionEncoder
+# Importing the MLP and RelationAggregator from ACE
+
 #should be able to handle episode data. 
 #episode data is (total_episode_size,timestep, feature_dim). where feature_dim = (state_dim + action_dim)
 
+
 class CrossAttention(nn.Module):
-    def __init__(self, input_size, heads, embed_size, offline_keys=None, offline_values=None):
+    def __init__(self, input_size, heads, embed_size, offline_keys=None, offline_values=None,
+                 state_len=None, relation_len=None, action_dim=None, use_ace_encoder=True):
         super().__init__()
         self.input_size = input_size
         self.heads = heads
         self.emb_size = embed_size
+        self.use_ace_encoder = use_ace_encoder
+        
+        # Initialize ACE encoder if requested
+        if use_ace_encoder and state_len is not None and relation_len is not None:
+            self.state_action_encoder = StateActionEncoder(
+                state_len=state_len,
+                relation_len=relation_len,
+                hidden_len=embed_size,
+                action_dim=action_dim
+            )
+            # Adjust input size for encoded features
+            actual_input_size = embed_size * 2 if action_dim is not None else embed_size
+        else:
+            self.state_action_encoder = None
+            actual_input_size = input_size
 
-        self.toqueries = nn.Linear(self.input_size, self.emb_size * heads, bias=False)
+        self.toqueries = nn.Linear(actual_input_size, self.emb_size * heads, bias=False)
         
         # offline parameters
         if offline_keys is not None and offline_values is not None:
-            # offline_keys: (#episodes, state_action_dim)
+            # offline_keys: (#episodes, state_action_dim) or raw obs format
             # offline_values: (#episodes, reward_steps)
+            if isinstance(offline_keys, dict):
+                # Process offline keys through encoder if they're in raw format
+                if self.state_action_encoder is not None:
+                    with torch.no_grad():
+                        processed_keys = []
+                        for episode_obs in offline_keys:
+                            encoded = self.state_action_encoder(episode_obs)
+                            # Take mean across entities if multi-agent
+                            if encoded.dim() == 3:
+                                encoded = encoded.mean(dim=1)
+                            processed_keys.append(encoded)
+                        offline_keys = torch.stack(processed_keys)
+            
             n_episodes = offline_keys.size(0)
             self.n_episodes = n_episodes
             
@@ -32,8 +65,15 @@ class CrossAttention(nn.Module):
             raise ValueError("Offline keys and values must be provided")
 
     def forward(self, x, curiosity_score=None):
+        # Handle raw observation input
+        if isinstance(x, dict) and self.state_action_encoder is not None:
+            # x is raw observation dict
+            x = self.state_action_encoder(x)
+            # Take mean across entities if multi-agent output
+            if x.dim() == 3:
+                x = x.mean(dim=1)
+        
         b, hin = x.size()    # (batch_size, input_size)
-        assert hin == self.input_size, f'Input size {hin} should match {self.input_size}'
         
         h = self.heads
         e = self.emb_size
